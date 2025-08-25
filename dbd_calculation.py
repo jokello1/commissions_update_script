@@ -595,7 +595,7 @@
 #
 # if __name__ == "__main__":
 #     main()
-
+import numpy as np
 import pandas as pd
 import psycopg
 
@@ -689,6 +689,14 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
             group[group['adjusted_expected'] > 0]) > 0 else group.iloc[0]['adjusted_expected']
         group['standardized_expected'] = first_expected
 
+        report_date_dt = pd.to_datetime(report_date)
+        total_payments_up_to_report = 0
+
+        for i, (_, row) in enumerate(group.iterrows()):
+            schedule_date = pd.to_datetime(row['schedule_date'])
+            if schedule_date <= report_date_dt:
+                total_payments_up_to_report += row['installment_received']
+
         # Step 2: Apply FIFO allocation - fully pay installments from beginning
         payments = group['installment_received'].tolist()
         total_payments_available = sum(payments)  # Total money available
@@ -718,19 +726,28 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
 
         # Update the group with calculated values
         group['allocated_payment'] = allocated_payments  # Individual installment allocation
-        group['cumulative_expected'] = cumulative_expected
+        # group['cumulative_expected'] = cumulative_expected
+        group['total_payments_up_to_report'] = total_payments_up_to_report
         # Total Received should show the individual allocated amount, not cumulative
         group['total_received'] = allocated_payments
-        group['arrears_amount'] = group['standardized_expected'] - group['total_received']
-        group['arrears_threshold'] = threshold * first_expected
+        group['arrears_threshold'] = threshold
+
+        # report_date_dt = pd.to_datetime(report_date)
+
 
         # Payment status flags based on Total Received vs Expected
-        group['paid'] = (group['total_received'] >= group['standardized_expected']).astype(int)
+        # group['paid'] = ((group['total_received']!= 0) &
+        #                  (group['total_received'] / group['standardized_expected'])>=threshold).astype(int)
+        group['paid'] = group.apply(calculate_paid_status, axis=1)
 
         # Calculate DPD: days between each installment's schedule date and first arrears date
-        report_date_dt = pd.to_datetime(report_date)
-        group['due'] = ((pd.to_datetime(group['schedule_date']) <= report_date_dt) &
-                       (group['total_received'] < group['standardized_expected'])).astype(int)
+        group['due'] = (pd.to_datetime(group['schedule_date']) <= report_date_dt).astype(int)
+        group['arrears_amount'] = np.where(
+            group['due']==1,
+            group['standardized_expected'] - group['total_received'],
+            0
+        )
+        group['arrears_amount'] = group['arrears_amount'].round(2)
 
         # Find first installment where total_received < expected (first arrears)
         unpaid_installments = group[group['total_received'] < group['standardized_expected']]
@@ -740,10 +757,9 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
             first_arrears_date = pd.to_datetime(unpaid_installments.iloc[0]['schedule_date'])
 
             # Calculate DPD for each installment: this_schedule_date - first_arrears_date if this installment is after first arrears
-            group['days_past_due'] = group.apply(lambda row:
-                                                 max(0,
-                                                     (report_date_dt - pd.to_datetime(row['schedule_date'])).days)
-                                                 if pd.to_datetime(row['schedule_date']) >= first_arrears_date
+            group['days_past_due'] = group.apply(lambda row_dpd: max(0,
+                                                     (report_date_dt - pd.to_datetime(row_dpd['schedule_date'])).days)
+                                                 if ((row_dpd['due']==1) & (row_dpd['paid']==0))
                                                  else 0, axis=1
                                                  )
         else:
@@ -752,8 +768,7 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
 
         # DPD Bucket based on each installment's DPD
         group['dpd_bucket'] = group.apply(lambda row:
-                                         'Paid' if (pd.to_datetime(row['schedule_date']) <= report_date_dt and
-                                                   row['total_received'] >= row['standardized_expected']) else
+                                         'Paid' if (row['due']==1 and row['paid']==1) else
                                          'Current' if 0 < row['days_past_due'] <= 31 else
                                          '30 Days' if 31 < row['days_past_due'] <= 60 else
                                          '60 Days' if 60 < row['days_past_due'] <= 90 else
@@ -775,7 +790,7 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
     result['Due Date'] = pd.to_datetime(result['schedule_date']).dt.strftime('%Y/%m/%d')
     result['Expected Payment'] = result['standardized_expected'].round(2)
     result['Instalment Amount'] = result['installment_received'].round(2)  # Original received amount
-    result['Total Payments'] = result['cumulative_expected'].round(2)  # Cumulative expected
+    result['Total Payments'] = result['total_payments_up_to_report'].round(2)  # Cumulative expected
     result['Total Received'] = result['total_received'].round(2)  # Individual allocated amount
     result['Arrears Amount'] = result['arrears_amount'].round(2)
     result['Arrears Threshold'] = result['arrears_threshold'].round(2)
@@ -800,6 +815,18 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
     ]
 
     return result[output_columns]
+
+def calculate_paid_status(row):
+    try:
+        if row['total_received'] == 0 :
+            return 0
+        if row['standardized_expected'] == 0:  # Prevent division by zero
+            return 0
+
+        ratio = row['total_received'] / row['standardized_expected']
+        return 1 if ratio >= row['arrears_threshold'] else 0
+    except (ZeroDivisionError, TypeError):
+        return 0
 
 
 def create_example_data():
@@ -922,8 +949,8 @@ def main():
         "port": "5432"
     }
 
-    report_date = "2024-01-31"
-    threshold = 0.1  # 10% threshold for arrears
+    report_date = "2025-07-31"
+    threshold = 0.9  # 10% threshold for arrears
 
     print("=== FIFO Payment Allocation Demo ===\n")
     """
