@@ -751,13 +751,15 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
             group['days_past_due'] = 0
 
         # DPD Bucket based on each installment's DPD
-        group['dpd_bucket'] = group['days_past_due'].apply(lambda dpd:
-                                                           'Paid' if dpd == 0 else
-                                                           'Current' if 0 < dpd <= 31 else
-                                                           '30 Days' if dpd <= 60 else
-                                                           '60 Days' if dpd <= 90 else
-                                                           '90 Days+'
-                                                           )
+        group['dpd_bucket'] = group.apply(lambda row:
+                                         'Paid' if (pd.to_datetime(row['schedule_date']) <= report_date_dt and
+                                                   row['total_received'] >= row['standardized_expected']) else
+                                         'Current' if 0 < row['days_past_due'] <= 31 else
+                                         '30 Days' if 31 < row['days_past_due'] <= 60 else
+                                         '60 Days' if 60 < row['days_past_due'] <= 90 else
+                                         '90 Days+' if row['days_past_due'] > 90 else
+                                         'Current',  # Default for future dates or edge cases
+                                         axis=1)
 
         # Months past due (CD) for each installment
         group['months_past_due'] = (group['days_past_due'] / 30).astype(int)
