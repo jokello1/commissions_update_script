@@ -606,14 +606,17 @@ def fetch_data(report_date: str, threshold: float, conn_params: dict) -> pd.Data
     """
     sql = """
     WITH schedule_data AS (
-        SELECT 
-            ssfls.loan_id,
-            ssfls."ScheduleDate",
-            (COALESCE(ssfls.principal_amount, 0)
-              + COALESCE(ssfls.interest_amount, 0)
-              + COALESCE(ssfls.fee_charges_amount, 0) 
-              + COALESCE(ssfls.penalty_charges_amount, 0)) AS expected_installment
-        FROM dbt_dom_za.fact_finconnect__simple_loan_schedule ssfls
+        SELECT
+		    ssfls.loan_id,
+		    ssfls."ScheduleDate",
+		    GREATEST(
+		        (COALESCE(ssfls.principal_amount, 0)
+		        + COALESCE(ssfls.interest_amount, 0)
+		        + COALESCE(ssfls.fee_charges_amount, 0)
+		        + COALESCE(ssfls.penalty_charges_amount, 0)),
+		        ssfls."ExpectedInstallment"
+		    )::numeric AS expected_installment
+		FROM dbt_dom_za.fact_finconnect__simple_loan_schedule ssfls
     ),
 
     repayment AS (
@@ -683,11 +686,28 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
                 'installment_received'] > 0
             else row['expected_installment'], axis=1
         )
+        # Get the most frequently appearing amount
+        mode_counts = group[group['adjusted_expected'] > 0]['adjusted_expected'].value_counts()
+        most_appearing = mode_counts.index[0] if len(mode_counts) > 0 else 0
 
-        # Use first non-zero expected payment as standard for all installments
+        # Get first non-zero expected payment
         first_expected = group[group['adjusted_expected'] > 0]['adjusted_expected'].iloc[0] if len(
             group[group['adjusted_expected'] > 0]) > 0 else group.iloc[0]['adjusted_expected']
-        group['standardized_expected'] = first_expected
+
+        # Check if difference between first and most appearing is more than 25% of most appearing
+        if most_appearing > 0 and abs(first_expected - most_appearing) > (0.25 * most_appearing):
+            standardized_amount = most_appearing
+            first_expected = most_appearing
+        else:
+            standardized_amount = first_expected
+
+
+        group['standardized_expected'] = standardized_amount
+
+        # Use first non-zero expected payment as standard for all installments
+        # first_expected = group[group['adjusted_expected'] > 0]['adjusted_expected'].iloc[0] if len(
+        #     group[group['adjusted_expected'] > 0]) > 0 else group.iloc[0]['adjusted_expected']
+        # group['standardized_expected'] = first_expected
 
         report_date_dt = pd.to_datetime(report_date)
         total_payments_up_to_report = 0
@@ -752,28 +772,34 @@ def apply_fifo_allocation(df: pd.DataFrame, threshold: float, report_date: str) 
         # Find first installment where total_received < expected (first arrears)
         unpaid_installments = group[group['total_received'] < group['standardized_expected']]
 
-        if len(unpaid_installments) > 0:
-            # Get the schedule date of the first unpaid installment (first arrears date)
-            first_arrears_date = pd.to_datetime(unpaid_installments.iloc[0]['schedule_date'])
-
-            # Calculate DPD for each installment: this_schedule_date - first_arrears_date if this installment is after first arrears
-            group['days_past_due'] = group.apply(lambda row_dpd: max(0,
-                                                     (report_date_dt - pd.to_datetime(row_dpd['schedule_date'])).days)
-                                                 if ((row_dpd['due']==1) & (row_dpd['paid']==0))
-                                                 else 0, axis=1
-                                                 )
-        else:
-            # All installments are fully paid
-            group['days_past_due'] = 0
+        # if len(unpaid_installments) > 0:
+        #     # Get the schedule date of the first unpaid installment (first arrears date)
+        #     first_arrears_date = pd.to_datetime(unpaid_installments.iloc[0]['schedule_date'])
+        #
+        #     # Calculate DPD for each installment: this_schedule_date - first_arrears_date if this installment is after first arrears
+        #     group['days_past_due'] = group.apply(lambda row_dpd: max(0,
+        #                                              (report_date_dt - pd.to_datetime(row_dpd['schedule_date'])).days)
+        #                                          if ((row_dpd['due']==1) & (row_dpd['paid']==0))
+        #                                          else 0, axis=1
+        #                                          )
+        # else:
+        #     # All installments are fully paid
+        #     group['days_past_due'] = 0
+        group['days_past_due'] = group.apply(
+            lambda row_dpd: max(0, (report_date_dt - pd.to_datetime( row_dpd['schedule_date'])).days)
+                if ((row_dpd['due'] == 1) & (row_dpd['paid'] == 0))
+                else 0, axis=1
+            )
 
         # DPD Bucket based on each installment's DPD
         group['dpd_bucket'] = group.apply(lambda row:
                                          'Paid' if (row['due']==1 and row['paid']==1) else
-                                         'Current' if 0 < row['days_past_due'] <= 31 else
-                                         '30 Days' if 31 < row['days_past_due'] <= 60 else
-                                         '60 Days' if 60 < row['days_past_due'] <= 90 else
+                                         'Due' if ((0 == row['days_past_due']) and row['due']==1) else
+                                         'Current' if ((0 < row['days_past_due'] <= 30) and row['due']==1) else
+                                         '30 Days' if 31 <= row['days_past_due'] <= 60 else
+                                         '60 Days' if 61 <= row['days_past_due'] <= 90 else
                                          '90 Days+' if row['days_past_due'] > 90 else
-                                         'Current',  # Default for future dates or edge cases
+                                         'Not Due',  # Default for future dates or edge cases
                                          axis=1)
 
         # Months past due (CD) for each installment
